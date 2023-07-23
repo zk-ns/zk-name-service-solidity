@@ -913,3 +913,1104 @@ abstract contract Context {
         return msg.data;
     }
 }
+
+pragma solidity ^0.8.0;
+
+
+abstract contract Fee is Ownable {
+    uint public constant BP_DENOMINATOR = 10000;
+
+    mapping(uint16 => FeeConfig) public chainIdToFeeBps;
+    uint16 public defaultFeeBp;
+    address public feeOwner; // defaults to owner
+
+    struct FeeConfig {
+        uint16 feeBP;
+        bool enabled;
+    }
+
+    event SetFeeBp(uint16 dstchainId, bool enabled, uint16 feeBp);
+    event SetDefaultFeeBp(uint16 feeBp);
+    event SetFeeOwner(address feeOwner);
+
+    constructor(){
+        feeOwner = owner();
+    }
+
+    function setDefaultFeeBp(uint16 _feeBp) public virtual onlyOwner {
+        require(_feeBp <= BP_DENOMINATOR, "Fee: fee bp must be <= BP_DENOMINATOR");
+        defaultFeeBp = _feeBp;
+        emit SetDefaultFeeBp(defaultFeeBp);
+    }
+
+    function setFeeBp(uint16 _dstChainId, bool _enabled, uint16 _feeBp) public virtual onlyOwner {
+        require(_feeBp <= BP_DENOMINATOR, "Fee: fee bp must be <= BP_DENOMINATOR");
+        chainIdToFeeBps[_dstChainId] = FeeConfig(_feeBp, _enabled);
+        emit SetFeeBp(_dstChainId, _enabled, _feeBp);
+    }
+
+    function setFeeOwner(address _feeOwner) public virtual onlyOwner {
+        require(_feeOwner != address(0x0), "Fee: feeOwner cannot be 0x");
+        feeOwner = _feeOwner;
+        emit SetFeeOwner(_feeOwner);
+    }
+
+    function quoteOFTFee(uint16 _dstChainId, uint _amount) public virtual view returns (uint fee) {
+        FeeConfig memory config = chainIdToFeeBps[_dstChainId];
+        if (config.enabled) {
+            fee = _amount * config.feeBP / BP_DENOMINATOR;
+        } else if (defaultFeeBp > 0) {
+            fee = _amount * defaultFeeBp / BP_DENOMINATOR;
+        } else {
+            fee = 0;
+        }
+    }
+
+    function _payOFTFee(address _from, uint16 _dstChainId, uint _amount) internal virtual returns (uint amount, uint fee) {
+        fee = quoteOFTFee(_dstChainId, _amount);
+        amount = _amount - fee;
+        if (fee > 0) {
+            _transferFrom(_from, feeOwner, fee);
+        }
+    }
+
+    function _transferFrom(address _from, address _to, uint _amount) internal virtual returns (uint);
+}
+
+pragma solidity ^0.8.0;
+
+/*
+ * a generic LzReceiver implementation
+ */
+abstract contract LzApp is Ownable, ILayerZeroReceiver, ILayerZeroUserApplicationConfig {
+    using BytesLib for bytes;
+
+    // ua can not send payload larger than this by default, but it can be changed by the ua owner
+    uint constant public DEFAULT_PAYLOAD_SIZE_LIMIT = 10000;
+
+    ILayerZeroEndpoint public immutable lzEndpoint;
+    mapping(uint16 => bytes) public trustedRemoteLookup;
+    mapping(uint16 => mapping(uint16 => uint)) public minDstGasLookup;
+    mapping(uint16 => uint) public payloadSizeLimitLookup;
+    address public precrime;
+
+    event SetPrecrime(address precrime);
+    event SetTrustedRemote(uint16 _remoteChainId, bytes _path);
+    event SetTrustedRemoteAddress(uint16 _remoteChainId, bytes _remoteAddress);
+    event SetMinDstGas(uint16 _dstChainId, uint16 _type, uint _minDstGas);
+
+    constructor(address _endpoint) {
+        lzEndpoint = ILayerZeroEndpoint(_endpoint);
+    }
+
+    function lzReceive(uint16 _srcChainId, bytes calldata _srcAddress, uint64 _nonce, bytes calldata _payload) public virtual override {
+        // lzReceive must be called by the endpoint for security
+        require(_msgSender() == address(lzEndpoint), "LzApp: invalid endpoint caller");
+
+        bytes memory trustedRemote = trustedRemoteLookup[_srcChainId];
+        // if will still block the message pathway from (srcChainId, srcAddress). should not receive message from untrusted remote.
+        require(_srcAddress.length == trustedRemote.length && trustedRemote.length > 0 && keccak256(_srcAddress) == keccak256(trustedRemote), "LzApp: invalid source sending contract");
+
+        _blockingLzReceive(_srcChainId, _srcAddress, _nonce, _payload);
+    }
+
+    // abstract function - the default behaviour of LayerZero is blocking. See: NonblockingLzApp if you dont need to enforce ordered messaging
+    function _blockingLzReceive(uint16 _srcChainId, bytes memory _srcAddress, uint64 _nonce, bytes memory _payload) internal virtual;
+
+    function _lzSend(uint16 _dstChainId, bytes memory _payload, address payable _refundAddress, address _zroPaymentAddress, bytes memory _adapterParams, uint _nativeFee) internal virtual {
+        bytes memory trustedRemote = trustedRemoteLookup[_dstChainId];
+        require(trustedRemote.length != 0, "LzApp: destination chain is not a trusted source");
+        _checkPayloadSize(_dstChainId, _payload.length);
+        lzEndpoint.send{value: _nativeFee}(_dstChainId, trustedRemote, _payload, _refundAddress, _zroPaymentAddress, _adapterParams);
+    }
+
+    function _checkGasLimit(uint16 _dstChainId, uint16 _type, bytes memory _adapterParams, uint _extraGas) internal view virtual {
+        uint providedGasLimit = _getGasLimit(_adapterParams);
+        uint minGasLimit = minDstGasLookup[_dstChainId][_type] + _extraGas;
+        require(minGasLimit > 0, "LzApp: minGasLimit not set");
+        require(providedGasLimit >= minGasLimit, "LzApp: gas limit is too low");
+    }
+
+    function _getGasLimit(bytes memory _adapterParams) internal pure virtual returns (uint gasLimit) {
+        require(_adapterParams.length >= 34, "LzApp: invalid adapterParams");
+        assembly {
+            gasLimit := mload(add(_adapterParams, 34))
+        }
+    }
+
+    function _checkPayloadSize(uint16 _dstChainId, uint _payloadSize) internal view virtual {
+        uint payloadSizeLimit = payloadSizeLimitLookup[_dstChainId];
+        if (payloadSizeLimit == 0) { // use default if not set
+            payloadSizeLimit = DEFAULT_PAYLOAD_SIZE_LIMIT;
+        }
+        require(_payloadSize <= payloadSizeLimit, "LzApp: payload size is too large");
+    }
+
+    //---------------------------UserApplication config----------------------------------------
+    function getConfig(uint16 _version, uint16 _chainId, address, uint _configType) external view returns (bytes memory) {
+        return lzEndpoint.getConfig(_version, _chainId, address(this), _configType);
+    }
+
+    // generic config for LayerZero user Application
+    function setConfig(uint16 _version, uint16 _chainId, uint _configType, bytes calldata _config) external override onlyOwner {
+        lzEndpoint.setConfig(_version, _chainId, _configType, _config);
+    }
+
+    function setSendVersion(uint16 _version) external override onlyOwner {
+        lzEndpoint.setSendVersion(_version);
+    }
+
+    function setReceiveVersion(uint16 _version) external override onlyOwner {
+        lzEndpoint.setReceiveVersion(_version);
+    }
+
+    function forceResumeReceive(uint16 _srcChainId, bytes calldata _srcAddress) external override onlyOwner {
+        lzEndpoint.forceResumeReceive(_srcChainId, _srcAddress);
+    }
+
+    // _path = abi.encodePacked(remoteAddress, localAddress)
+    // this function set the trusted path for the cross-chain communication
+    function setTrustedRemote(uint16 _remoteChainId, bytes calldata _path) external onlyOwner {
+        trustedRemoteLookup[_remoteChainId] = _path;
+        emit SetTrustedRemote(_remoteChainId, _path);
+    }
+
+    function setTrustedRemoteAddress(uint16 _remoteChainId, bytes calldata _remoteAddress) external onlyOwner {
+        trustedRemoteLookup[_remoteChainId] = abi.encodePacked(_remoteAddress, address(this));
+        emit SetTrustedRemoteAddress(_remoteChainId, _remoteAddress);
+    }
+
+    function getTrustedRemoteAddress(uint16 _remoteChainId) external view returns (bytes memory) {
+        bytes memory path = trustedRemoteLookup[_remoteChainId];
+        require(path.length != 0, "LzApp: no trusted path record");
+        return path.slice(0, path.length - 20); // the last 20 bytes should be address(this)
+    }
+
+    function setPrecrime(address _precrime) external onlyOwner {
+        precrime = _precrime;
+        emit SetPrecrime(_precrime);
+    }
+
+    function setMinDstGas(uint16 _dstChainId, uint16 _packetType, uint _minGas) external onlyOwner {
+        require(_minGas > 0, "LzApp: invalid minGas");
+        minDstGasLookup[_dstChainId][_packetType] = _minGas;
+        emit SetMinDstGas(_dstChainId, _packetType, _minGas);
+    }
+
+    // if the size is 0, it means default size limit
+    function setPayloadSizeLimit(uint16 _dstChainId, uint _size) external onlyOwner {
+        payloadSizeLimitLookup[_dstChainId] = _size;
+    }
+
+    //--------------------------- VIEW FUNCTION ----------------------------------------
+    function isTrustedRemote(uint16 _srcChainId, bytes calldata _srcAddress) external view returns (bool) {
+        bytes memory trustedSource = trustedRemoteLookup[_srcChainId];
+        return keccak256(trustedSource) == keccak256(_srcAddress);
+    }
+}
+
+pragma solidity ^0.8.0;
+
+
+
+/*
+ * the default LayerZero messaging behaviour is blocking, i.e. any failed message will block the channel
+ * this abstract class try-catch all fail messages and store locally for future retry. hence, non-blocking
+ * NOTE: if the srcAddress is not configured properly, it will still block the message pathway from (srcChainId, srcAddress)
+ */
+abstract contract NonblockingLzApp is LzApp {
+    using ExcessivelySafeCall for address;
+
+    constructor(address _endpoint) LzApp(_endpoint) {}
+
+    mapping(uint16 => mapping(bytes => mapping(uint64 => bytes32))) public failedMessages;
+
+    event MessageFailed(uint16 _srcChainId, bytes _srcAddress, uint64 _nonce, bytes _payload, bytes _reason);
+    event RetryMessageSuccess(uint16 _srcChainId, bytes _srcAddress, uint64 _nonce, bytes32 _payloadHash);
+
+    // overriding the virtual function in LzReceiver
+    function _blockingLzReceive(uint16 _srcChainId, bytes memory _srcAddress, uint64 _nonce, bytes memory _payload) internal virtual override {
+        (bool success, bytes memory reason) = address(this).excessivelySafeCall(gasleft(), 150, abi.encodeWithSelector(this.nonblockingLzReceive.selector, _srcChainId, _srcAddress, _nonce, _payload));
+        // try-catch all errors/exceptions
+        if (!success) {
+            _storeFailedMessage(_srcChainId, _srcAddress, _nonce, _payload, reason);
+        }
+    }
+
+    function _storeFailedMessage(uint16 _srcChainId, bytes memory _srcAddress, uint64 _nonce, bytes memory _payload, bytes memory _reason) internal virtual {
+        failedMessages[_srcChainId][_srcAddress][_nonce] = keccak256(_payload);
+        emit MessageFailed(_srcChainId, _srcAddress, _nonce, _payload, _reason);
+    }
+
+    function nonblockingLzReceive(uint16 _srcChainId, bytes calldata _srcAddress, uint64 _nonce, bytes calldata _payload) public virtual {
+        // only internal transaction
+        require(_msgSender() == address(this), "NonblockingLzApp: caller must be LzApp");
+        _nonblockingLzReceive(_srcChainId, _srcAddress, _nonce, _payload);
+    }
+
+    //@notice override this function
+    function _nonblockingLzReceive(uint16 _srcChainId, bytes memory _srcAddress, uint64 _nonce, bytes memory _payload) internal virtual;
+
+    function retryMessage(uint16 _srcChainId, bytes calldata _srcAddress, uint64 _nonce, bytes calldata _payload) public payable virtual {
+        // assert there is message to retry
+        bytes32 payloadHash = failedMessages[_srcChainId][_srcAddress][_nonce];
+        require(payloadHash != bytes32(0), "NonblockingLzApp: no stored message");
+        require(keccak256(_payload) == payloadHash, "NonblockingLzApp: invalid payload");
+        // clear the stored message
+        failedMessages[_srcChainId][_srcAddress][_nonce] = bytes32(0);
+        // execute the message. revert if it fails again
+        _nonblockingLzReceive(_srcChainId, _srcAddress, _nonce, _payload);
+        emit RetryMessageSuccess(_srcChainId, _srcAddress, _nonce, payloadHash);
+    }
+}
+
+pragma solidity ^0.8.0;
+
+
+abstract contract OFTCoreV2 is NonblockingLzApp {
+    using BytesLib for bytes;
+    using ExcessivelySafeCall for address;
+
+    uint public constant NO_EXTRA_GAS = 0;
+
+    // packet type
+    uint8 public constant PT_SEND = 0;
+    uint8 public constant PT_SEND_AND_CALL = 1;
+
+    uint8 public immutable sharedDecimals;
+
+    bool public useCustomAdapterParams;
+    mapping(uint16 => mapping(bytes => mapping(uint64 => bool))) public creditedPackets;
+
+    /**
+     * @dev Emitted when `_amount` tokens are moved from the `_sender` to (`_dstChainId`, `_toAddress`)
+     * `_nonce` is the outbound nonce
+     */
+    event SendToChain(uint16 indexed _dstChainId, address indexed _from, bytes32 indexed _toAddress, uint _amount);
+
+    /**
+     * @dev Emitted when `_amount` tokens are received from `_srcChainId` into the `_toAddress` on the local chain.
+     * `_nonce` is the inbound nonce.
+     */
+    event ReceiveFromChain(uint16 indexed _srcChainId, address indexed _to, uint _amount);
+
+    event SetUseCustomAdapterParams(bool _useCustomAdapterParams);
+
+    event CallOFTReceivedSuccess(uint16 indexed _srcChainId, bytes _srcAddress, uint64 _nonce, bytes32 _hash);
+
+    event NonContractAddress(address _address);
+
+    // _sharedDecimals should be the minimum decimals on all chains
+    constructor(uint8 _sharedDecimals, address _lzEndpoint) NonblockingLzApp(_lzEndpoint) {
+        sharedDecimals = _sharedDecimals;
+    }
+
+    /************************************************************************
+    * public functions
+    ************************************************************************/
+    function callOnOFTReceived(uint16 _srcChainId, bytes calldata _srcAddress, uint64 _nonce, bytes32 _from, address _to, uint _amount, bytes calldata _payload, uint _gasForCall) public virtual {
+        require(_msgSender() == address(this), "OFTCore: caller must be OFTCore");
+
+        // send
+        _amount = _transferFrom(address(this), _to, _amount);
+        emit ReceiveFromChain(_srcChainId, _to, _amount);
+
+        // call
+        IOFTReceiverV2(_to).onOFTReceived{gas: _gasForCall}(_srcChainId, _srcAddress, _nonce, _from, _amount, _payload);
+    }
+
+    function setUseCustomAdapterParams(bool _useCustomAdapterParams) public virtual onlyOwner {
+        useCustomAdapterParams = _useCustomAdapterParams;
+        emit SetUseCustomAdapterParams(_useCustomAdapterParams);
+    }
+
+    /************************************************************************
+    * internal functions
+    ************************************************************************/
+    function _estimateSendFee(uint16 _dstChainId, bytes32 _toAddress, uint _amount, bool _useZro, bytes memory _adapterParams) internal view virtual returns (uint nativeFee, uint zroFee) {
+        // mock the payload for sendFrom()
+        bytes memory payload = _encodeSendPayload(_toAddress, _ld2sd(_amount));
+        return lzEndpoint.estimateFees(_dstChainId, address(this), payload, _useZro, _adapterParams);
+    }
+
+    function _estimateSendAndCallFee(uint16 _dstChainId, bytes32 _toAddress, uint _amount, bytes memory _payload, uint64 _dstGasForCall, bool _useZro, bytes memory _adapterParams) internal view virtual returns (uint nativeFee, uint zroFee) {
+        // mock the payload for sendAndCall()
+        bytes memory payload = _encodeSendAndCallPayload(msg.sender, _toAddress, _ld2sd(_amount), _payload, _dstGasForCall);
+        return lzEndpoint.estimateFees(_dstChainId, address(this), payload, _useZro, _adapterParams);
+    }
+
+    function _nonblockingLzReceive(uint16 _srcChainId, bytes memory _srcAddress, uint64 _nonce, bytes memory _payload) internal virtual override {
+        uint8 packetType = _payload.toUint8(0);
+
+        if (packetType == PT_SEND) {
+            _sendAck(_srcChainId, _srcAddress, _nonce, _payload);
+        } else if (packetType == PT_SEND_AND_CALL) {
+            _sendAndCallAck(_srcChainId, _srcAddress, _nonce, _payload);
+        } else {
+            revert("OFTCore: unknown packet type");
+        }
+    }
+
+    function _send(address _from, uint16 _dstChainId, bytes32 _toAddress, uint _amount, address payable _refundAddress, address _zroPaymentAddress, bytes memory _adapterParams) internal virtual returns (uint amount) {
+        _checkAdapterParams(_dstChainId, PT_SEND, _adapterParams, NO_EXTRA_GAS);
+
+        (amount,) = _removeDust(_amount);
+        amount = _debitFrom(_from, _dstChainId, _toAddress, amount); // amount returned should not have dust
+        require(amount > 0, "OFTCore: amount too small");
+
+        bytes memory lzPayload = _encodeSendPayload(_toAddress, _ld2sd(amount));
+        _lzSend(_dstChainId, lzPayload, _refundAddress, _zroPaymentAddress, _adapterParams, msg.value);
+
+        emit SendToChain(_dstChainId, _from, _toAddress, amount);
+    }
+
+    function _sendAck(uint16 _srcChainId, bytes memory, uint64, bytes memory _payload) internal virtual {
+        (address to, uint64 amountSD) = _decodeSendPayload(_payload);
+        if (to == address(0)) {
+            to = address(0xdead);
+        }
+
+        uint amount = _sd2ld(amountSD);
+        amount = _creditTo(_srcChainId, to, amount);
+
+        emit ReceiveFromChain(_srcChainId, to, amount);
+    }
+
+    function _sendAndCall(address _from, uint16 _dstChainId, bytes32 _toAddress, uint _amount, bytes memory _payload, uint64 _dstGasForCall, address payable _refundAddress, address _zroPaymentAddress, bytes memory _adapterParams) internal virtual returns (uint amount) {
+        _checkAdapterParams(_dstChainId, PT_SEND_AND_CALL, _adapterParams, _dstGasForCall);
+
+        (amount,) = _removeDust(_amount);
+        amount = _debitFrom(_from, _dstChainId, _toAddress, amount);
+        require(amount > 0, "OFTCore: amount too small");
+
+        // encode the msg.sender into the payload instead of _from
+        bytes memory lzPayload = _encodeSendAndCallPayload(msg.sender, _toAddress, _ld2sd(amount), _payload, _dstGasForCall);
+        _lzSend(_dstChainId, lzPayload, _refundAddress, _zroPaymentAddress, _adapterParams, msg.value);
+
+        emit SendToChain(_dstChainId, _from, _toAddress, amount);
+    }
+
+    function _sendAndCallAck(uint16 _srcChainId, bytes memory _srcAddress, uint64 _nonce, bytes memory _payload) internal virtual {
+        (bytes32 from, address to, uint64 amountSD, bytes memory payloadForCall, uint64 gasForCall) = _decodeSendAndCallPayload(_payload);
+
+        bool credited = creditedPackets[_srcChainId][_srcAddress][_nonce];
+        uint amount = _sd2ld(amountSD);
+
+        // credit to this contract first, and then transfer to receiver only if callOnOFTReceived() succeeds
+        if (!credited) {
+            amount = _creditTo(_srcChainId, address(this), amount);
+            creditedPackets[_srcChainId][_srcAddress][_nonce] = true;
+        }
+
+        if (!_isContract(to)) {
+            emit NonContractAddress(to);
+            return;
+        }
+
+        // workaround for stack too deep
+        uint16 srcChainId = _srcChainId;
+        bytes memory srcAddress = _srcAddress;
+        uint64 nonce = _nonce;
+        bytes memory payload = _payload;
+        bytes32 from_ = from;
+        address to_ = to;
+        uint amount_ = amount;
+        bytes memory payloadForCall_ = payloadForCall;
+
+        // no gas limit for the call if retry
+        uint gas = credited ? gasleft() : gasForCall;
+        (bool success, bytes memory reason) = address(this).excessivelySafeCall(gasleft(), 150, abi.encodeWithSelector(this.callOnOFTReceived.selector, srcChainId, srcAddress, nonce, from_, to_, amount_, payloadForCall_, gas));
+
+        if (success) {
+            bytes32 hash = keccak256(payload);
+            emit CallOFTReceivedSuccess(srcChainId, srcAddress, nonce, hash);
+        } else {
+            // store the failed message into the nonblockingLzApp
+            _storeFailedMessage(srcChainId, srcAddress, nonce, payload, reason);
+        }
+    }
+
+    function _isContract(address _account) internal view returns (bool) {
+        return _account.code.length > 0;
+    }
+
+    function _checkAdapterParams(uint16 _dstChainId, uint16 _pkType, bytes memory _adapterParams, uint _extraGas) internal virtual {
+        if (useCustomAdapterParams) {
+            _checkGasLimit(_dstChainId, _pkType, _adapterParams, _extraGas);
+        } else {
+            require(_adapterParams.length == 0, "OFTCore: _adapterParams must be empty.");
+        }
+    }
+
+    function _ld2sd(uint _amount) internal virtual view returns (uint64) {
+        uint amountSD = _amount / _ld2sdRate();
+        require(amountSD <= type(uint64).max, "OFTCore: amountSD overflow");
+        return uint64(amountSD);
+    }
+
+    function _sd2ld(uint64 _amountSD) internal virtual view returns (uint) {
+        return _amountSD * _ld2sdRate();
+    }
+
+    function _removeDust(uint _amount) internal virtual view returns (uint amountAfter, uint dust) {
+        dust = _amount % _ld2sdRate();
+        amountAfter = _amount - dust;
+    }
+
+    function _encodeSendPayload(bytes32 _toAddress, uint64 _amountSD) internal virtual view returns (bytes memory) {
+        return abi.encodePacked(PT_SEND, _toAddress, _amountSD);
+    }
+
+    function _decodeSendPayload(bytes memory _payload) internal virtual view returns (address to, uint64 amountSD) {
+        require(_payload.toUint8(0) == PT_SEND && _payload.length == 41, "OFTCore: invalid payload");
+
+        to = _payload.toAddress(13); // drop the first 12 bytes of bytes32
+        amountSD = _payload.toUint64(33);
+    }
+
+    function _encodeSendAndCallPayload(address _from, bytes32 _toAddress, uint64 _amountSD, bytes memory _payload, uint64 _dstGasForCall) internal virtual view returns (bytes memory) {
+        return abi.encodePacked(
+            PT_SEND_AND_CALL,
+            _toAddress,
+            _amountSD,
+            _addressToBytes32(_from),
+            _dstGasForCall,
+            _payload
+        );
+    }
+
+    function _decodeSendAndCallPayload(bytes memory _payload) internal virtual view returns (bytes32 from, address to, uint64 amountSD, bytes memory payload, uint64 dstGasForCall) {
+        require(_payload.toUint8(0) == PT_SEND_AND_CALL, "OFTCore: invalid payload");
+
+        to = _payload.toAddress(13); // drop the first 12 bytes of bytes32
+        amountSD = _payload.toUint64(33);
+        from = _payload.toBytes32(41);
+        dstGasForCall = _payload.toUint64(73);
+        payload = _payload.slice(81, _payload.length - 81);
+    }
+
+    function _addressToBytes32(address _address) internal pure virtual returns (bytes32) {
+        return bytes32(uint(uint160(_address)));
+    }
+
+    function _debitFrom(address _from, uint16 _dstChainId, bytes32 _toAddress, uint _amount) internal virtual returns (uint);
+
+    function _creditTo(uint16 _srcChainId, address _toAddress, uint _amount) internal virtual returns (uint);
+
+    function _transferFrom(address _from, address _to, uint _amount) internal virtual returns (uint);
+
+    function _ld2sdRate() internal view virtual returns (uint);
+}
+
+pragma solidity ^0.8.0;
+
+
+
+
+
+abstract contract BaseOFTWithFee is OFTCoreV2, Fee, ERC165, IOFTWithFee {
+
+    constructor(uint8 _sharedDecimals, address _lzEndpoint) OFTCoreV2(_sharedDecimals, _lzEndpoint) {
+    }
+
+    /************************************************************************
+    * public functions
+    ************************************************************************/
+    function sendFrom(address _from, uint16 _dstChainId, bytes32 _toAddress, uint _amount, uint _minAmount, LzCallParams calldata _callParams) public payable virtual override {
+        (_amount,) = _payOFTFee(_from, _dstChainId, _amount);
+        _amount = _send(_from, _dstChainId, _toAddress, _amount, _callParams.refundAddress, _callParams.zroPaymentAddress, _callParams.adapterParams);
+        require(_amount >= _minAmount, "BaseOFTWithFee: amount is less than minAmount");
+    }
+
+    function sendAndCall(address _from, uint16 _dstChainId, bytes32 _toAddress, uint _amount, uint _minAmount, bytes calldata _payload, uint64 _dstGasForCall, LzCallParams calldata _callParams) public payable virtual override {
+        (_amount,) = _payOFTFee(_from, _dstChainId, _amount);
+        _amount = _sendAndCall(_from, _dstChainId, _toAddress, _amount, _payload, _dstGasForCall, _callParams.refundAddress, _callParams.zroPaymentAddress, _callParams.adapterParams);
+        require(_amount >= _minAmount, "BaseOFTWithFee: amount is less than minAmount");
+    }
+
+    /************************************************************************
+    * public view functions
+    ************************************************************************/
+    function supportsInterface(bytes4 interfaceId) public view virtual override(ERC165, IERC165) returns (bool) {
+        return interfaceId == type(IOFTWithFee).interfaceId || super.supportsInterface(interfaceId);
+    }
+
+    function estimateSendFee(uint16 _dstChainId, bytes32 _toAddress, uint _amount, bool _useZro, bytes calldata _adapterParams) public view virtual override returns (uint nativeFee, uint zroFee) {
+        return _estimateSendFee(_dstChainId, _toAddress, _amount, _useZro, _adapterParams);
+    }
+
+    function estimateSendAndCallFee(uint16 _dstChainId, bytes32 _toAddress, uint _amount, bytes calldata _payload, uint64 _dstGasForCall, bool _useZro, bytes calldata _adapterParams) public view virtual override returns (uint nativeFee, uint zroFee) {
+        return _estimateSendAndCallFee(_dstChainId, _toAddress, _amount, _payload, _dstGasForCall, _useZro, _adapterParams);
+    }
+
+    function circulatingSupply() public view virtual override returns (uint);
+
+    function token() public view virtual override returns (address);
+
+    function _transferFrom(address _from, address _to, uint _amount) internal virtual override (Fee, OFTCoreV2) returns (uint);
+}
+
+pragma solidity ^0.8.0;
+
+/**
+ * @dev Interface of the ERC20 standard as defined in the EIP.
+ */
+interface IERC20 {
+    /**
+     * @dev Emitted when `value` tokens are moved from one account (`from`) to
+     * another (`to`).
+     *
+     * Note that `value` may be zero.
+     */
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    /**
+     * @dev Emitted when the allowance of a `spender` for an `owner` is set by
+     * a call to {approve}. `value` is the new allowance.
+     */
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /**
+     * @dev Returns the amount of tokens in existence.
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @dev Returns the amount of tokens owned by `account`.
+     */
+    function balanceOf(address account) external view returns (uint256);
+
+    /**
+     * @dev Moves `amount` tokens from the caller's account to `to`.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Returns the remaining number of tokens that `spender` will be
+     * allowed to spend on behalf of `owner` through {transferFrom}. This is
+     * zero by default.
+     *
+     * This value changes when {approve} or {transferFrom} are called.
+     */
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * IMPORTANT: Beware that changing an allowance with this method brings the risk
+     * that someone may use both the old and the new allowance by unfortunate
+     * transaction ordering. One possible solution to mitigate this race
+     * condition is to first reduce the spender's allowance to 0 and set the
+     * desired value afterwards:
+     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729
+     *
+     * Emits an {Approval} event.
+     */
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    /**
+     * @dev Moves `amount` tokens from `from` to `to` using the
+     * allowance mechanism. `amount` is then deducted from the caller's
+     * allowance.
+     *
+     * Returns a boolean value indicating whether the operation succeeded.
+     *
+     * Emits a {Transfer} event.
+     */
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+pragma solidity ^0.8.0;
+
+
+/**
+ * @dev Interface for the optional metadata functions from the ERC20 standard.
+ *
+ * _Available since v4.1._
+ */
+interface IERC20Metadata is IERC20 {
+    /**
+     * @dev Returns the name of the token.
+     */
+    function name() external view returns (string memory);
+
+    /**
+     * @dev Returns the symbol of the token.
+     */
+    function symbol() external view returns (string memory);
+
+    /**
+     * @dev Returns the decimals places of the token.
+     */
+    function decimals() external view returns (uint8);
+}
+
+pragma solidity ^0.8.0;
+
+
+
+
+/**
+ * @dev Implementation of the {IERC20} interface.
+ *
+ * This implementation is agnostic to the way tokens are created. This means
+ * that a supply mechanism has to be added in a derived contract using {_mint}.
+ * For a generic mechanism see {ERC20PresetMinterPauser}.
+ *
+ * TIP: For a detailed writeup see our guide
+ * https://forum.openzeppelin.com/t/how-to-implement-erc20-supply-mechanisms/226[How
+ * to implement supply mechanisms].
+ *
+ * The default value of {decimals} is 18. To change this, you should override
+ * this function so it returns a different value.
+ *
+ * We have followed general OpenZeppelin Contracts guidelines: functions revert
+ * instead returning `false` on failure. This behavior is nonetheless
+ * conventional and does not conflict with the expectations of ERC20
+ * applications.
+ *
+ * Additionally, an {Approval} event is emitted on calls to {transferFrom}.
+ * This allows applications to reconstruct the allowance for all accounts just
+ * by listening to said events. Other implementations of the EIP may not emit
+ * these events, as it isn't required by the specification.
+ *
+ * Finally, the non-standard {decreaseAllowance} and {increaseAllowance}
+ * functions have been added to mitigate the well-known issues around setting
+ * allowances. See {IERC20-approve}.
+ */
+contract ERC20 is Context, IERC20, IERC20Metadata {
+    mapping(address => uint256) private _balances;
+
+    mapping(address => mapping(address => uint256)) private _allowances;
+
+    uint256 private _totalSupply;
+
+    string private _name;
+    string private _symbol;
+
+    /**
+     * @dev Sets the values for {name} and {symbol}.
+     *
+     * All two of these values are immutable: they can only be set once during
+     * construction.
+     */
+    constructor(string memory name_, string memory symbol_) {
+        _name = name_;
+        _symbol = symbol_;
+    }
+
+    /**
+     * @dev Returns the name of the token.
+     */
+    function name() public view virtual override returns (string memory) {
+        return _name;
+    }
+
+    /**
+     * @dev Returns the symbol of the token, usually a shorter version of the
+     * name.
+     */
+    function symbol() public view virtual override returns (string memory) {
+        return _symbol;
+    }
+
+    /**
+     * @dev Returns the number of decimals used to get its user representation.
+     * For example, if `decimals` equals `2`, a balance of `505` tokens should
+     * be displayed to a user as `5.05` (`505 / 10 ** 2`).
+     *
+     * Tokens usually opt for a value of 18, imitating the relationship between
+     * Ether and Wei. This is the default value returned by this function, unless
+     * it's overridden.
+     *
+     * NOTE: This information is only used for _display_ purposes: it in
+     * no way affects any of the arithmetic of the contract, including
+     * {IERC20-balanceOf} and {IERC20-transfer}.
+     */
+    function decimals() public view virtual override returns (uint8) {
+        return 18;
+    }
+
+    /**
+     * @dev See {IERC20-totalSupply}.
+     */
+    function totalSupply() public view virtual override returns (uint256) {
+        return _totalSupply;
+    }
+
+    /**
+     * @dev See {IERC20-balanceOf}.
+     */
+    function balanceOf(address account) public view virtual override returns (uint256) {
+        return _balances[account];
+    }
+
+    /**
+     * @dev See {IERC20-transfer}.
+     *
+     * Requirements:
+     *
+     * - `to` cannot be the zero address.
+     * - the caller must have a balance of at least `amount`.
+     */
+    function transfer(address to, uint256 amount) public virtual override returns (bool) {
+        address owner = _msgSender();
+        _transfer(owner, to, amount);
+        return true;
+    }
+
+    /**
+     * @dev See {IERC20-allowance}.
+     */
+    function allowance(address owner, address spender) public view virtual override returns (uint256) {
+        return _allowances[owner][spender];
+    }
+
+    /**
+     * @dev See {IERC20-approve}.
+     *
+     * NOTE: If `amount` is the maximum `uint256`, the allowance is not updated on
+     * `transferFrom`. This is semantically equivalent to an infinite approval.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     */
+    function approve(address spender, uint256 amount) public virtual override returns (bool) {
+        address owner = _msgSender();
+        _approve(owner, spender, amount);
+        return true;
+    }
+
+    /**
+     * @dev See {IERC20-transferFrom}.
+     *
+     * Emits an {Approval} event indicating the updated allowance. This is not
+     * required by the EIP. See the note at the beginning of {ERC20}.
+     *
+     * NOTE: Does not update the allowance if the current allowance
+     * is the maximum `uint256`.
+     *
+     * Requirements:
+     *
+     * - `from` and `to` cannot be the zero address.
+     * - `from` must have a balance of at least `amount`.
+     * - the caller must have allowance for ``from``'s tokens of at least
+     * `amount`.
+     */
+    function transferFrom(address from, address to, uint256 amount) public virtual override returns (bool) {
+        address spender = _msgSender();
+        _spendAllowance(from, spender, amount);
+        _transfer(from, to, amount);
+        return true;
+    }
+
+    /**
+     * @dev Atomically increases the allowance granted to `spender` by the caller.
+     *
+     * This is an alternative to {approve} that can be used as a mitigation for
+     * problems described in {IERC20-approve}.
+     *
+     * Emits an {Approval} event indicating the updated allowance.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     */
+    function increaseAllowance(address spender, uint256 addedValue) public virtual returns (bool) {
+        address owner = _msgSender();
+        _approve(owner, spender, allowance(owner, spender) + addedValue);
+        return true;
+    }
+
+    /**
+     * @dev Atomically decreases the allowance granted to `spender` by the caller.
+     *
+     * This is an alternative to {approve} that can be used as a mitigation for
+     * problems described in {IERC20-approve}.
+     *
+     * Emits an {Approval} event indicating the updated allowance.
+     *
+     * Requirements:
+     *
+     * - `spender` cannot be the zero address.
+     * - `spender` must have allowance for the caller of at least
+     * `subtractedValue`.
+     */
+    function decreaseAllowance(address spender, uint256 subtractedValue) public virtual returns (bool) {
+        address owner = _msgSender();
+        uint256 currentAllowance = allowance(owner, spender);
+        require(currentAllowance >= subtractedValue, "ERC20: decreased allowance below zero");
+        unchecked {
+            _approve(owner, spender, currentAllowance - subtractedValue);
+        }
+
+        return true;
+    }
+
+    /**
+     * @dev Moves `amount` of tokens from `from` to `to`.
+     *
+     * This internal function is equivalent to {transfer}, and can be used to
+     * e.g. implement automatic token fees, slashing mechanisms, etc.
+     *
+     * Emits a {Transfer} event.
+     *
+     * Requirements:
+     *
+     * - `from` cannot be the zero address.
+     * - `to` cannot be the zero address.
+     * - `from` must have a balance of at least `amount`.
+     */
+    function _transfer(address from, address to, uint256 amount) internal virtual {
+        require(from != address(0), "ERC20: transfer from the zero address");
+        require(to != address(0), "ERC20: transfer to the zero address");
+
+        _beforeTokenTransfer(from, to, amount);
+
+        uint256 fromBalance = _balances[from];
+        require(fromBalance >= amount, "ERC20: transfer amount exceeds balance");
+        unchecked {
+            _balances[from] = fromBalance - amount;
+            // Overflow not possible: the sum of all balances is capped by totalSupply, and the sum is preserved by
+            // decrementing then incrementing.
+            _balances[to] += amount;
+        }
+
+        emit Transfer(from, to, amount);
+
+        _afterTokenTransfer(from, to, amount);
+    }
+
+    /** @dev Creates `amount` tokens and assigns them to `account`, increasing
+     * the total supply.
+     *
+     * Emits a {Transfer} event with `from` set to the zero address.
+     *
+     * Requirements:
+     *
+     * - `account` cannot be the zero address.
+     */
+    function _mint(address account, uint256 amount) internal virtual {
+        require(account != address(0), "ERC20: mint to the zero address");
+
+        _beforeTokenTransfer(address(0), account, amount);
+
+        _totalSupply += amount;
+        unchecked {
+            // Overflow not possible: balance + amount is at most totalSupply + amount, which is checked above.
+            _balances[account] += amount;
+        }
+        emit Transfer(address(0), account, amount);
+
+        _afterTokenTransfer(address(0), account, amount);
+    }
+
+    /**
+     * @dev Destroys `amount` tokens from `account`, reducing the
+     * total supply.
+     *
+     * Emits a {Transfer} event with `to` set to the zero address.
+     *
+     * Requirements:
+     *
+     * - `account` cannot be the zero address.
+     * - `account` must have at least `amount` tokens.
+     */
+    function _burn(address account, uint256 amount) internal virtual {
+        require(account != address(0), "ERC20: burn from the zero address");
+
+        _beforeTokenTransfer(account, address(0), amount);
+
+        uint256 accountBalance = _balances[account];
+        require(accountBalance >= amount, "ERC20: burn amount exceeds balance");
+        unchecked {
+            _balances[account] = accountBalance - amount;
+            // Overflow not possible: amount <= accountBalance <= totalSupply.
+            _totalSupply -= amount;
+        }
+
+        emit Transfer(account, address(0), amount);
+
+        _afterTokenTransfer(account, address(0), amount);
+    }
+
+    /**
+     * @dev Sets `amount` as the allowance of `spender` over the `owner` s tokens.
+     *
+     * This internal function is equivalent to `approve`, and can be used to
+     * e.g. set automatic allowances for certain subsystems, etc.
+     *
+     * Emits an {Approval} event.
+     *
+     * Requirements:
+     *
+     * - `owner` cannot be the zero address.
+     * - `spender` cannot be the zero address.
+     */
+    function _approve(address owner, address spender, uint256 amount) internal virtual {
+        require(owner != address(0), "ERC20: approve from the zero address");
+        require(spender != address(0), "ERC20: approve to the zero address");
+
+        _allowances[owner][spender] = amount;
+        emit Approval(owner, spender, amount);
+    }
+
+    /**
+     * @dev Updates `owner` s allowance for `spender` based on spent `amount`.
+     *
+     * Does not update the allowance amount in case of infinite allowance.
+     * Revert if not enough allowance is available.
+     *
+     * Might emit an {Approval} event.
+     */
+    function _spendAllowance(address owner, address spender, uint256 amount) internal virtual {
+        uint256 currentAllowance = allowance(owner, spender);
+        if (currentAllowance != type(uint256).max) {
+            require(currentAllowance >= amount, "ERC20: insufficient allowance");
+            unchecked {
+                _approve(owner, spender, currentAllowance - amount);
+            }
+        }
+    }
+
+    /**
+     * @dev Hook that is called before any transfer of tokens. This includes
+     * minting and burning.
+     *
+     * Calling conditions:
+     *
+     * - when `from` and `to` are both non-zero, `amount` of ``from``'s tokens
+     * will be transferred to `to`.
+     * - when `from` is zero, `amount` tokens will be minted for `to`.
+     * - when `to` is zero, `amount` of ``from``'s tokens will be burned.
+     * - `from` and `to` are never both zero.
+     *
+     * To learn more about hooks, head to xref:ROOT:extending-contracts.adoc#using-hooks[Using Hooks].
+     */
+    function _beforeTokenTransfer(address from, address to, uint256 amount) internal virtual {}
+
+    /**
+     * @dev Hook that is called after any transfer of tokens. This includes
+     * minting and burning.
+     *
+     * Calling conditions:
+     *
+     * - when `from` and `to` are both non-zero, `amount` of ``from``'s tokens
+     * has been transferred to `to`.
+     * - when `from` is zero, `amount` tokens have been minted for `to`.
+     * - when `to` is zero, `amount` of ``from``'s tokens have been burned.
+     * - `from` and `to` are never both zero.
+     *
+     * To learn more about hooks, head to xref:ROOT:extending-contracts.adoc#using-hooks[Using Hooks].
+     */
+    function _afterTokenTransfer(address from, address to, uint256 amount) internal virtual {}
+}
+
+pragma solidity ^0.8.0;
+
+contract OFTWithFee is BaseOFTWithFee, ERC20 {
+
+    uint internal immutable ld2sdRate;
+
+    constructor(string memory _name, string memory _symbol, uint8 _sharedDecimals, address _lzEndpoint) ERC20(_name, _symbol) BaseOFTWithFee(_sharedDecimals, _lzEndpoint) {
+        uint8 decimals = decimals();
+        require(_sharedDecimals <= decimals, "OFTWithFee: sharedDecimals must be <= decimals");
+        ld2sdRate = 10 ** (decimals - _sharedDecimals);
+    }
+
+    /************************************************************************
+    * public functions
+    ************************************************************************/
+    function circulatingSupply() public view virtual override returns (uint) {
+        return totalSupply();
+    }
+
+    function token() public view virtual override returns (address) {
+        return address(this);
+    }
+
+    /************************************************************************
+    * internal functions
+    ************************************************************************/
+    function _debitFrom(address _from, uint16, bytes32, uint _amount) internal virtual override returns (uint) {
+        address spender = _msgSender();
+        if (_from != spender) _spendAllowance(_from, spender, _amount);
+        _burn(_from, _amount);
+        return _amount;
+    }
+
+    function _creditTo(uint16, address _toAddress, uint _amount) internal virtual override returns (uint) {
+        _mint(_toAddress, _amount);
+        return _amount;
+    }
+
+    function _transferFrom(address _from, address _to, uint _amount) internal virtual override returns (uint) {
+        address spender = _msgSender();
+        // if transfer from this contract, no need to check allowance
+        if (_from != address(this) && _from != spender) _spendAllowance(_from, spender, _amount);
+        _transfer(_from, _to, _amount);
+        return _amount;
+    }
+
+    function _ld2sdRate() internal view virtual override returns (uint) {
+        return ld2sdRate;
+    }
+}
+
+pragma solidity ^0.8.9;
+
+
+
+contract NGTToken is OFTWithFee {
+
+    // address public constant burn = 0x000000000000000000000000000000000000dEaD;
+    address public friend;
+    address public poolfriend;
+    // ERC20 public Token;
+    uint256 public mintAmount;
+    uint256 public poolAmount;
+
+    constructor(string memory _name, string memory _symbol, uint8 _sharedDecimals, address _lzEndpoint) OFTWithFee(_name, _symbol, _sharedDecimals, _lzEndpoint) {
+        mintAmount = 0;
+        poolAmount = 0;
+    }
+
+    receive() external payable {}
+    fallback() external payable {}
+
+    function mint(address to, uint256 amount) public {
+        require(msg.sender == friend, "not allowed!");
+        if(mintAmount + amount <=1000000000 * 10**uint256(decimals())){
+            mintAmount += amount;
+           _mint(to, amount);
+        }
+        
+    }
+    function poolMint(address to, uint256 amount) public{
+        require(msg.sender == poolfriend, "not allowed!");
+        if(poolAmount + amount <=100000000 * 10**uint256(decimals())){
+            poolAmount += amount;
+            _mint(to, amount);
+        }
+    }
+
+    function setFriend(address _friend) public onlyOwner{
+        friend = _friend;
+    }
+    function setpoolFriend(address _poolfriend) public onlyOwner{
+        poolfriend = _poolfriend;
+    }
+
+    function claim() public onlyOwner{
+        uint256 balance = address(this).balance;
+        payable (msg.sender).transfer(balance);
+    }  
+
+}
