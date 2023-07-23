@@ -21,10 +21,6 @@ interface IERC165 {
     function supportsInterface(bytes4 interfaceId) external view returns (bool);
 }
 
-// File: @openzeppelin/contracts/utils/introspection/ERC165.sol
-
-
-// OpenZeppelin Contracts v4.4.1 (utils/introspection/ERC165.sol)
 
 pragma solidity ^0.8.0;
 
@@ -69,7 +65,6 @@ interface IOFTReceiverV2 {
 
 pragma solidity >=0.5.0;
 
-
 /**
  * @dev Interface of the IOFT core standard
  */
@@ -104,12 +99,7 @@ interface ICommonOFT is IERC165 {
     function token() external view returns (address);
 }
 
-// File: https://github.com/LayerZero-Labs/solidity-examples/blob/main/contracts/token/oft/v2/fee/IOFTWithFee.sol
-
-
-
 pragma solidity >=0.5.0;
-
 
 /**
  * @dev Interface of the IOFT core standard
@@ -131,8 +121,6 @@ interface IOFTWithFee is ICommonOFT {
 
     function sendAndCall(address _from, uint16 _dstChainId, bytes32 _toAddress, uint _amount, uint _minAmount, bytes calldata _payload, uint64 _dstGasForCall, LzCallParams calldata _callParams) external payable;
 }
-
-// File: https://github.com/LayerZero-Labs/solidity-examples/blob/main/contracts/util/ExcessivelySafeCall.sol
 
 
 pragma solidity >=0.7.6;
@@ -270,8 +258,6 @@ library ExcessivelySafeCall {
         }
     }
 }
-
-// File: https://github.com/LayerZero-Labs/solidity-examples/blob/main/contracts/util/BytesLib.sol
 
 
 /*
@@ -905,10 +891,6 @@ interface ILayerZeroReceiver {
     function lzReceive(uint16 _srcChainId, bytes calldata _srcAddress, uint64 _nonce, bytes calldata _payload) external;
 }
 
-// File: @openzeppelin/contracts/utils/Context.sol
-
-
-// OpenZeppelin Contracts v4.4.1 (utils/Context.sol)
 
 pragma solidity ^0.8.0;
 
